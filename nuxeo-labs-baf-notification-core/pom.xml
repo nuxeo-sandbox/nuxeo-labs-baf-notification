@@ -4,7 +4,7 @@
   <parent>
     <groupId>nuxeo.labs.baf.notification</groupId>
     <artifactId>nuxeo-labs-baf-notification-parent</artifactId>
-    <version>2025.1.0-SNAPSHOT</version>
+    <version>2025.2.0-SNAPSHOT</version>
   </parent>
   <artifactId>nuxeo-labs-baf-notification-core</artifactId>
   <name>Nuxeo Labs BAF Notification - Core</name>

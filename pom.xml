@@ -9,7 +9,7 @@
 
   <groupId>nuxeo.labs.baf.notification</groupId>
   <artifactId>nuxeo-labs-baf-notification-parent</artifactId>
-  <version>2025.1.0-SNAPSHOT</version>
+  <version>2025.2.0-SNAPSHOT</version>
   <name>Nuxeo Labs BAF Notification</name>
   <description>Fires a Nuxeo event when a Bulk Action Framework command completes or aborts</description>
   <packaging>pom</packaging>
