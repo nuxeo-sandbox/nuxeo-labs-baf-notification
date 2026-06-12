@@ -11,6 +11,11 @@
     <object class="nuxeo.labs.bafnotification.BAFNotificationConfigDescriptor" />
   </extension-point>
 
+  <!-- Automation operations exposed by this plugin. -->
+  <extension target="org.nuxeo.ecm.core.operation.OperationServiceComponent" point="operations">
+    <operation class="nuxeo.labs.bafnotification.ListenOnceOp" />
+  </extension>
+
   <!--
     Example contribution. Without any contribution, the bulkActionDone event is fired
     for every completed/aborted BAF command. As soon as one contribution exists, only

@@ -78,18 +78,28 @@ public class BulkActionDoneComputation extends AbstractComputation {
         var codec = BulkCodecs.getStatusCodec();
         var status = codec.decode(record.getData());
 
-        // Filter: only fire the event for action names allowed by BAFNotificationService.
-        // When no contribution is registered, the service returns true for every action.
+        // Decide whether to fire. Two independent reasons can trigger an event:
+        //   1. A one-shot subscription was registered for this specific commandId
+        //      (BAFNotification.ListenOnce). consumeOneShotForCommand is atomic and removes the
+        //      entry as a side effect — call it FIRST and unconditionally so the entry is cleared
+        //      even if shouldNotify would also have matched. We still only fire once thanks to ||.
+        //   2. The action name matches the static filter (or no static filter is contributed,
+        //      in which case shouldNotify returns true for everything).
         var notificationService = Framework.getService(BAFNotificationService.class);
-        if (notificationService != null && !notificationService.shouldNotify(status.getAction())) {
+        boolean oneShot = notificationService != null
+                && notificationService.consumeOneShotForCommand(status.getId());
+        boolean staticMatch = notificationService == null
+                || notificationService.shouldNotify(status.getAction());
+
+        if (!oneShot && !staticMatch) {
             log.debug("Skipping {} event (filtered out) for command: {}, action: {}",
                     EVENT_NAME, status.getId(), status.getAction());
             context.askForCheckpoint();
             return;
         }
 
-        log.debug("Firing {} event for command: {}, action: {}, state: {}",
-                EVENT_NAME, status.getId(), status.getAction(), status.getState());
+        log.debug("Firing {} event (oneShot={}) for command: {}, action: {}, state: {}",
+                EVENT_NAME, oneShot, status.getId(), status.getAction(), status.getState());
 
         // Look up the originating BulkCommand to expose its repository, query and params.
         // The command record is normally still in the bulk KV store when bulk/done fires,
