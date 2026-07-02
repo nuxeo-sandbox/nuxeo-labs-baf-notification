@@ -3,7 +3,7 @@
 A Nuxeo plugin that fires an event (`bulkActionDone`) when a Bulk Action Framework (BAF) command completes or aborts.
 
 > [!IMPORTANT]
-> By default, it sends the event for all and every action, and Nuxeo spreads _a lot_ of BAF actions, because it uses the BAF even for a single document (index a document saved by a user, generate a rendition, ...), so, in production, without any filter, you may be notified a lot every second, while you need to be notified only _some_ actions: You may want to avoid running a listener (and/or an automation chain) for no reason, so you don't use CPU, memory, ... when not needed.
+> By default, it sends the event for all and every action, and Nuxeo spreads _a lot_ of BAF actions, because it uses the BAF even for a single document: Index a document saved by a user, generate a picture views (For example, 10 users uploading 10 images => 100 "recomputeViews" actions), etc. So, in production, without any filter, you may be notified a lot every second, while you very likely need to be notified only for _some_ actions: You may want to avoid running a listener (and/or an automation chain) for no reason.
 > 
 > So, consider filtering the actions your are listening to, see below, [Filtering Which Actions Trigger the Event](#filtering-which-actions-trigger-the-event).
 
