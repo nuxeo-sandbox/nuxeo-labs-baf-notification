@@ -4,7 +4,7 @@ Nuxeo LTS 2025 plugin: consumes the Nuxeo Stream `bulk/done` and fires a synchro
 
 Standard Nuxeo plugin conventions apply. Notes below are repo-specific only. User-facing usage docs live in `README.md` — don't duplicate them here.
 
-Parent: `org.nuxeo:nuxeo-parent:2025.18`. Target platform: `2025.*`. Project version: `2025.2.0-SNAPSHOT`. Existing code uses `@since 2025.1`; new public API should use `@since 2025.2` (track `<version>` in the parent POM, not the parent's `2025.18`). Do NOT use `2025.18` or the current LTS dot version.
+Parent: `org.nuxeo:nuxeo-parent:2025.18`. Target platform: `2025.*`. Project version: `2025.3.0-SNAPSHOT`. Released so far: `2025.1.0`, `2025.2.0`. Existing code uses `@since 2025.1` and `@since 2025.2`; new public API should use `@since 2025.3` (track `<version>` in the parent POM, not the parent's `2025.18`). Do NOT use `2025.18` or the current LTS dot version. After each release, bump this line to the new snapshot.
 
 ## Modules
 
