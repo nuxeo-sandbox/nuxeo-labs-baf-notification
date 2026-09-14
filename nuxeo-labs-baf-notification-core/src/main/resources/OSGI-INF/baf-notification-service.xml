@@ -17,6 +17,11 @@
     the listed action names trigger the event. Multiple contributions are merged (union),
     so a Studio project and a custom plugin can each contribute their own list.
 
+    WARNING: contributing an empty <actions/> block (or one whose action names are all
+    blank) registers a contribution with an empty union, which blocks EVERY event. To
+    restore the fire-all default, remove the contribution entirely rather than emptying
+    it. The service logs a WARNING and raises a runtime message if this happens.
+
     <extension target="nuxeo.labs.baf.notification.service" point="configuration">
       <actions>
         <action>setProperties</action>

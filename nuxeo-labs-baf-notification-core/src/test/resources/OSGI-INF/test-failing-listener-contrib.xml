@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<component name="nuxeo.labs.baf.notification.test.failing.listener">
+
+  <!-- Inline listener that throws ConcurrentUpdateException the first time it sees a given commandId.
+       Used to verify that the computation re-throws it so the stream policy retries the record.
+       Deployed per-test only: it must never be active for the other test classes. -->
+  <extension target="org.nuxeo.ecm.core.event.EventServiceComponent" point="listener">
+    <listener name="testBulkActionDoneFailingListener"
+        class="nuxeo.labs.bafnotification.TestBulkActionDoneErrorHandling$FailingOnceListener">
+      <event>bulkActionDone</event>
+    </listener>
+  </extension>
+
+</component>

@@ -6,6 +6,15 @@
         class="nuxeo.labs.bafnotification.TestBulkActionDoneEvent$TestBulkActionDoneListener">
       <event>bulkActionDone</event>
     </listener>
+
+    <!-- Regression guard: post-commit listeners must be notified too. They only are if the event is fired
+         inside a transaction, so that EventServiceImpl drains its thread-local bundle on commit.
+         async="true" is the form Nuxeo recommends (see NXP-26911) and the one the README points integrators to. -->
+    <listener name="testBulkActionDonePostCommitListener"
+        class="nuxeo.labs.bafnotification.TestBulkActionDoneEvent$TestBulkActionDonePostCommitListener"
+        postCommit="true" async="true">
+      <event>bulkActionDone</event>
+    </listener>
   </extension>
 
 </component>

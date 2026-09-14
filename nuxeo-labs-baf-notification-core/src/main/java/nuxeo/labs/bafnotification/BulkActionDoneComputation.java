@@ -24,6 +24,7 @@ import java.util.Map;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.nuxeo.ecm.core.api.ConcurrentUpdateException;
 import org.nuxeo.ecm.core.bulk.BulkCodecs;
 import org.nuxeo.ecm.core.bulk.BulkService;
 import org.nuxeo.ecm.core.event.EventService;
@@ -33,6 +34,7 @@ import org.nuxeo.lib.stream.computation.AbstractComputation;
 import org.nuxeo.lib.stream.computation.ComputationContext;
 import org.nuxeo.lib.stream.computation.Record;
 import org.nuxeo.runtime.api.Framework;
+import org.nuxeo.runtime.transaction.TransactionHelper;
 
 /**
  * Stream computation that consumes the {@code bulk/done} stream and fires a synchronous
@@ -52,9 +54,21 @@ import org.nuxeo.runtime.api.Framework;
  * <li>{@code processingDurationMillis} - total processing duration in ms</li>
  * <li>{@code repository} - the repository the command ran against (null if the command record was already evicted)</li>
  * <li>{@code query} - the NXQL query used to scroll documents (null for non-query scrollers or if evicted)</li>
- * <li>{@code actionParams} - the raw {@code Map<String, Serializable>} from {@link
- *     org.nuxeo.ecm.core.bulk.message.BulkCommand#getParams()} (empty map if the command record was already evicted)</li>
+ * <li>{@code actionParams} - the raw {@code Map<String, Serializable>} from
+ *     {@link org.nuxeo.ecm.core.bulk.message.BulkCommand#getParams()} (empty map if the command record was
+ *     already evicted)</li>
  * </ul>
+ * <p>
+ * <b>Transaction.</b> A stream computation thread carries no ambient transaction. The event is therefore fired inside
+ * an explicit {@link TransactionHelper#runInTransaction(Runnable)} block. This is required, not cosmetic: without it
+ * {@code EventServiceImpl#recordEvent} parks the event in a thread-local bundle that is never drained (memory leak),
+ * post-commit and asynchronous listeners never run, and any listener opening a {@code CoreSession} fails with
+ * {@code "Cannot use a session outside a transaction"}.
+ * <p>
+ * <b>Delivery semantics.</b> Delivery is <b>at-least-once</b>, not exactly-once. Nuxeo stream computations checkpoint
+ * asynchronously, so a node failure, restart or consumer rebalance can redeliver the same {@code bulk/done} record; in
+ * addition the upstream {@code bulk/done} stream can itself carry duplicate records for a single command. Listeners
+ * must be idempotent and should deduplicate on {@code commandId}.
  *
  * @since 2025.1
  */
@@ -69,14 +83,21 @@ public class BulkActionDoneComputation extends AbstractComputation {
      */
     public static final String EVENT_NAME = "bulkActionDone";
 
+    // Id of the record being processed, kept only to enrich processFailure logging. A computation instance is
+    // single-threaded, so a plain field is safe here.
+    protected String currentCommandId;
+
     public BulkActionDoneComputation() {
         super(COMPUTATION_NAME, 1, 0);
     }
 
     @Override
     public void processRecord(ComputationContext context, String inputStreamName, Record record) {
+        // Reset before decoding: if the decode itself fails, processFailure must not report the previous record's id.
+        currentCommandId = null;
         var codec = BulkCodecs.getStatusCodec();
         var status = codec.decode(record.getData());
+        currentCommandId = status.getId();
 
         // Filter: only fire the event for action names allowed by BAFNotificationService.
         // When no contribution is registered, the service returns true for every action.
@@ -91,23 +112,28 @@ public class BulkActionDoneComputation extends AbstractComputation {
         log.debug("Firing {} event for command: {}, action: {}, state: {}",
                 EVENT_NAME, status.getId(), status.getAction(), status.getState());
 
-        // Look up the originating BulkCommand to expose its repository, query and params.
-        // The command record is normally still in the bulk KV store when bulk/done fires,
-        // but we guard against eviction so the event is always emitted.
+        /*
+         * Look up the originating BulkCommand to expose its repository, query and params. BulkServiceImpl applies a
+         * TTL to the command record once the command reaches a final state (1h when COMPLETED), so it may already be
+         * gone - for instance when an old bulk/done record is replayed. Guard against eviction so the event is always
+         * emitted, with those three properties null/empty.
+         */
         var cmd = Framework.getService(BulkService.class).getCommand(status.getId());
         String repository = cmd != null ? cmd.getRepository() : null;
         String query = cmd != null ? cmd.getQuery() : null;
-        Map<String, Serializable> actionParams = (cmd != null && cmd.getParams() != null)
-                ? cmd.getParams() : Map.of();
+        Map<String, Serializable> actionParams = cmd != null ? cmd.getParams() : Map.of();
         if (cmd == null) {
             log.debug("BulkCommand {} no longer available; firing event without command fields", status.getId());
         }
+
+        // BulkStatus#state has no @NotNull contract: guard rather than risk an NPE that would burn the retry budget.
+        var state = status.getState();
 
         var eventCtx = new EventContextImpl();
         eventCtx.setProperty("commandId", status.getId());
         eventCtx.setProperty("action", status.getAction());
         eventCtx.setProperty("username", status.getUsername());
-        eventCtx.setProperty("state", status.getState().name());
+        eventCtx.setProperty("state", state != null ? state.name() : null);
         eventCtx.setProperty("processed", status.getProcessed());
         eventCtx.setProperty("total", status.getTotal());
         eventCtx.setProperty("errorCount", status.getErrorCount());
@@ -120,12 +146,30 @@ public class BulkActionDoneComputation extends AbstractComputation {
 
         var event = new EventImpl(EVENT_NAME, eventCtx);
         try {
-            Framework.getService(EventService.class).fireEvent(event);
+            /*
+             * A stream computation thread has no ambient transaction. Opening one here is mandatory: it lets
+             * EventServiceImpl register its JTA Synchronization (so the thread-local event bundle is drained instead
+             * of leaking, and post-commit/async listeners actually run), and it gives listeners a usable CoreSession.
+             */
+            TransactionHelper.runInTransaction(() -> Framework.getService(EventService.class).fireEvent(event));
+        } catch (ConcurrentUpdateException e) {
+            // The platform re-throws this on purpose so the caller can retry. Propagate it to the stream policy
+            // without checkpointing, so the record is replayed.
+            log.warn("Concurrent update while firing {} event for command: {}, action: {}; letting the stream retry",
+                    EVENT_NAME, status.getId(), status.getAction(), e);
+            throw e;
         } catch (RuntimeException e) {
             log.error("Error firing {} event for command: {}, action: {}", EVENT_NAME, status.getId(),
                     status.getAction(), e);
         }
 
         context.askForCheckpoint();
+    }
+
+    @Override
+    public void processFailure(ComputationContext context, Throwable failure) {
+        log.error("Computation: {} dropped the bulk/done record at offset: {} after retries; no {} event was fired"
+                + " for command: {}", COMPUTATION_NAME, context.getLastOffset(), EVENT_NAME, currentCommandId,
+                failure);
     }
 }

@@ -30,6 +30,13 @@ import org.nuxeo.common.xmap.annotation.XObject;
  * {@link BAFNotificationService}. Each contributed {@code <actions>} block lists the BAF
  * action names that should trigger the {@code bulkActionDone} event. Multiple
  * contributions are merged (union) by the service.
+ * <p>
+ * This class intentionally does <b>not</b> implement {@link org.nuxeo.runtime.model.Descriptor} and defines neither
+ * {@code equals} nor {@code hashCode}: the service unions every contribution instead of merging or replacing them by
+ * id, and therefore tracks descriptors by identity through the legacy
+ * {@link BAFNotificationServiceImpl#registerContribution} path. Migrating this to the modern
+ * {@code DescriptorRegistry} would key contributions on {@code getId()} and silently replace same-id contributions,
+ * breaking the documented union semantics. Do not "modernize" it without changing the contract first.
  *
  * @since 2025.1
  */

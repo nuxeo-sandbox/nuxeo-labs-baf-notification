@@ -19,13 +19,13 @@
  */
 package nuxeo.labs.bafnotification;
 
-import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.nuxeo.runtime.RuntimeMessage.Level;
 import org.nuxeo.runtime.model.ComponentInstance;
 import org.nuxeo.runtime.model.DefaultComponent;
 
@@ -36,6 +36,12 @@ import org.nuxeo.runtime.model.DefaultComponent;
  * set of action names (union). Tracks whether at least one contribution was registered
  * so the service can distinguish the "no contribution = fire all" default from an
  * explicit empty filter.
+ * <p>
+ * <b>Concurrency.</b> {@link #shouldNotify(String)} is called from the {@code bulkActionDoneNotifier} stream
+ * computation thread while contributions register/unregister on the runtime thread. The effective filter is therefore
+ * held in a single {@code volatile} immutable {@link FilterState} snapshot that is replaced atomically by
+ * {@link #rebuildActions()}. Readers take one volatile read and so always observe a coherent state - never a
+ * half-rebuilt one, which would silently drop events.
  *
  * @since 2025.1
  */
@@ -45,12 +51,22 @@ public class BAFNotificationServiceImpl extends DefaultComponent implements BAFN
 
     public static final String XP_CONFIGURATION = "configuration";
 
-    // Use a concurrent set so reads from the stream computation thread are safe while
-    // contributions register/unregister on the runtime thread.
-    protected final Set<String> configuredActions = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    /**
+     * Immutable snapshot of the effective filter: whether any contribution is registered, and the union of their
+     * action names. Both fields must be observed together, hence a single object behind one volatile reference.
+     *
+     * @since 2025.2
+     */
+    protected record FilterState(boolean hasContributions, Set<String> actions) {
+
+        protected static final FilterState EMPTY = new FilterState(false, Set.of());
+    }
+
+    // Replaced wholesale by rebuildActions(); never mutated in place.
+    protected volatile FilterState filterState = FilterState.EMPTY;
 
     // Tracks distinct contributions so unregister can flip hasContributions back to false
-    // when the last one is removed.
+    // when the last one is removed. Only mutated from the runtime thread.
     protected final Set<BAFNotificationConfigDescriptor> contributions = ConcurrentHashMap.newKeySet();
 
     @Override
@@ -81,29 +97,41 @@ public class BAFNotificationServiceImpl extends DefaultComponent implements BAFN
                 }
             }
         }
-        configuredActions.clear();
-        configuredActions.addAll(union);
+        boolean hasContributions = !contributions.isEmpty();
+        // Single volatile write: readers see either the previous or the new state, never a mix.
+        filterState = new FilterState(hasContributions, Set.copyOf(union));
+
+        if (hasContributions && union.isEmpty()) {
+            var message = ("BAF notification: %d configuration contribution(s) registered but the effective action"
+                    + " list is empty, so NO bulkActionDone event will be fired. Remove the contribution(s) to restore"
+                    + " the fire-all default, or list at least one action name.").formatted(contributions.size());
+            log.warn(message);
+            addRuntimeMessage(Level.WARNING, message);
+        } else if (hasContributions) {
+            log.info("BAF notification filter updated, bulkActionDone fired only for actions: {}", union);
+        } else {
+            log.info("BAF notification filter updated: no contribution registered, bulkActionDone fired for every"
+                    + " action.");
+        }
     }
 
     @Override
     public boolean shouldNotify(String actionName) {
+        var state = filterState; // one volatile read -> coherent snapshot
         // No contribution at all -> default behavior: fire for every action.
-        if (contributions.isEmpty()) {
+        if (!state.hasContributions()) {
             return true;
         }
-        if (actionName == null) {
-            return false;
-        }
-        return configuredActions.contains(actionName);
+        return actionName != null && state.actions().contains(actionName);
     }
 
     @Override
     public Set<String> getConfiguredActions() {
-        return Set.copyOf(configuredActions);
+        return filterState.actions(); // already an immutable Set.copyOf
     }
 
     @Override
     public boolean hasContributions() {
-        return !contributions.isEmpty();
+        return filterState.hasContributions();
     }
 }

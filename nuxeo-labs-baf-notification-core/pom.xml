@@ -21,6 +21,12 @@
       <artifactId>nuxeo-core-event</artifactId>
       <scope>provided</scope>
     </dependency>
+    <!-- ConcurrentUpdateException -->
+    <dependency>
+      <groupId>org.nuxeo.ecm.core</groupId>
+      <artifactId>nuxeo-core-api</artifactId>
+      <scope>provided</scope>
+    </dependency>
     <dependency>
       <groupId>org.nuxeo.runtime</groupId>
       <artifactId>nuxeo-runtime-stream</artifactId>
@@ -29,6 +35,12 @@
     <dependency>
       <groupId>org.nuxeo.runtime</groupId>
       <artifactId>nuxeo-runtime</artifactId>
+      <scope>provided</scope>
+    </dependency>
+    <!-- TransactionHelper -->
+    <dependency>
+      <groupId>org.nuxeo.runtime</groupId>
+      <artifactId>nuxeo-runtime-jtajca</artifactId>
       <scope>provided</scope>
     </dependency>
     <dependency>

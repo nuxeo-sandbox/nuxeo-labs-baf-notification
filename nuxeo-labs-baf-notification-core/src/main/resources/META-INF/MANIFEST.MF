@@ -2,7 +2,7 @@ Bundle-ActivationPolicy: lazy
 Bundle-ClassPath: .
 Manifest-Version: 1.0
 Bundle-Vendor: nuxeo.labs.baf.notification
-Bundle-Version: 1.0.0
+Bundle-Version: 2025.2.0
 Bundle-Name: nuxeo-labs-baf-notification-core
 Bundle-ManifestVersion: 2
 Bundle-SymbolicName: nuxeo.labs.baf.notification.nuxeo-labs-baf-notification-core;singleton=true

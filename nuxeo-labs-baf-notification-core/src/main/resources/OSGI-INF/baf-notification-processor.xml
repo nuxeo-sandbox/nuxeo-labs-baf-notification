@@ -1,6 +1,9 @@
 <?xml version="1.0"?>
 <component name="nuxeo.labs.baf.notification">
 
+  <!-- bulk/done is declared and initialized by org.nuxeo.ecm.core.bulk.config: require it so the log exists
+       before our tailer is created. The service component provides the action-name filter consulted by the
+       computation, so it must be ready before the computation starts. Do not remove either. -->
   <require>org.nuxeo.ecm.core.bulk.config</require>
   <require>nuxeo.labs.baf.notification.service</require>
 
@@ -8,6 +11,15 @@
     <streamProcessor name="bulkActionDoneNotifier"
         class="nuxeo.labs.bafnotification.BulkActionDoneProcessor"
         defaultConcurrency="1" defaultPartitions="1">
+      <!-- bulk/done is owned by org.nuxeo.ecm.core.bulk.config: we only consume it, we must not try to create it.
+           Its size is 1, which is why defaultConcurrency/defaultPartitions are 1 - that is the maximum useful
+           concurrency for a consumer of this stream. -->
+      <stream name="bulk/done" external="true" />
+      <!-- Retries cover infrastructure-level failures only: Avro decoding, the bulk KV store lookup, and
+           ConcurrentUpdateException raised by a listener (which BulkActionDoneComputation re-throws on purpose).
+           Any other listener exception is caught and logged by the computation and is never retried, so a
+           misbehaving listener cannot block the pipeline. continueOnFailure keeps bulk/done flowing if a record
+           is unprocessable after the retry budget is exhausted. -->
       <policy name="default" maxRetries="3" delay="500ms" maxDelay="10s"
               continueOnFailure="true" />
     </streamProcessor>
