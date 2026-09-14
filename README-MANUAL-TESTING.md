@@ -14,7 +14,7 @@ harness cannot reach: the Nuxeo Studio / Web UI wiring, and anything that depend
 mvn clean install
 ```
 
-23 tests across 5 classes. They cover the whole notification pipeline, including several defects that are easy to
+24 tests across 5 classes. They cover the whole notification pipeline, including several defects that are easy to
 reintroduce:
 
 | Behaviour verified | Test |
@@ -22,6 +22,8 @@ reintroduce:
 | The event is fired inside a transaction, so listeners can open a `CoreSession` | `TestBulkActionDoneEvent#testListenerRunsInTransactionAndCanUseCoreSession` |
 | Events are not left to accumulate on the stream computation thread (memory leak) | `TestBulkActionDoneEvent#testNoEventBundleLeakOnComputationThread` |
 | Post-commit and asynchronous listeners are actually notified | `TestBulkActionDoneEvent#testPostCommitListenerIsNotified` |
+| The full event payload is delivered, not just a subset | `TestBulkActionDoneEvent#testEventFiredOnCompletion` |
+| A custom action's `BulkStatus.setResult(...)` map reaches the listener | `TestBulkActionDoneEvent#testActionResultIsForwardedToTheEvent` |
 | The same command can be delivered more than once (at-least-once delivery) | `TestBulkActionDoneStreamSemantics#testReplayRedeliversSameCommandId` |
 | Moving the consumer to the end of the stream skips a backlog | `TestBulkActionDoneStreamSemantics#testPositionToEndSkipsBacklog` |
 | Lag builds up behind a stopped or slow consumer, then drains | `TestBulkActionDoneStreamSemantics#testLagGrowsWhileComputationStopped` |
@@ -212,10 +214,18 @@ function run(input, params) {
 | Chain to call | `BAFNotifSmoke` |
 | Events | `bulkActionDone` |
 | Document filters | *(leave all empty)* |
+| User filters | *(leave all empty)* |
 
-> **Leave the document filters empty.** `bulkActionDone` carries no source document, so any doctype, facet,
-> lifecycle or path filter evaluates against `null` and silently discards the event. If your handler never fires,
-> check this first.
+> **Leave every filter empty — document filters *and* user filters.** `bulkActionDone` carries no source document
+> and no principal, and the two families fail differently:
+>
+> - **Document filters** (doctype, facet, lifecycle, path, attribute) evaluate against `null` and **silently
+>   discard** the event.
+> - **User filters** (*is member of group*, *is administrator*) evaluate against a `null` principal and throw a
+>   `NullPointerException` that Nuxeo swallows — the chain **never runs** and the only trace is a stack trace in
+>   `server.log`.
+>
+> If your handler never fires, check this first. Filter inside the chain instead, on `action` / `username`.
 
 Deploy the Studio project.
 
@@ -344,6 +354,7 @@ grep "BAF notification filter updated" "$NXLOG" | tail -1   # effective action f
 grep "effective action list is empty" "$NXLOG"              # empty-contribution misconfiguration
 grep "Cannot use a session outside a transaction" "$NXLOG"  # listener could not open a session
 grep "dropped the bulk/done record" "$NXLOG"                # record abandoned after retries
+grep -A5 "EventHandler.isEnabled" "$NXLOG"                  # handler has a user filter -> NPE, chain never ran
 ```
 
 | Thing | Value |

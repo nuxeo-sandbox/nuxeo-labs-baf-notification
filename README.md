@@ -7,6 +7,21 @@ A Nuxeo plugin that fires an event (`bulkActionDone`) when a Bulk Action Framewo
 > 
 > So, consider filtering the actions your are listening to, see below, [Filtering Which Actions Trigger the Event](#filtering-which-actions-trigger-the-event).
 
+> [!CAUTION]
+> **Never write documents from an unfiltered listener.**
+>
+> This is the single most dangerous way to use this plugin, and it is easy to do by accident.
+>
+> Nuxeo uses the BAF for its own housekeeping — indexing, renditions, fulltext extraction, picture views. A listener that **creates or modifies documents** schedules new bulk commands, which fire new `bulkActionDone` events, which run your listener again. That is an unbounded feedback loop, and because the default is fire-all it closes immediately. It does not degrade the server gradually; it saturates it.
+>
+> Before you write anything from a listener:
+>
+> 1. **Restrict the plugin to the action names you own** — see [Filtering Which Actions Trigger the Event](#filtering-which-actions-trigger-the-event). Treat this as a prerequisite, not an optimisation.
+> 2. **Re-check `action` inside the listener**, so a later contribution widening the filter cannot reach your handler.
+> 3. **Make sure the actions your own writes trigger are not in your filter list.** Saving a document triggers `reindex`; generating a rendition triggers `recomputeViews`.
+>
+> If your listener only reads, or only calls out to an external system, none of this applies — but keep [Keep listeners fast](#keep-listeners-fast) in mind.
+
 
 ## The `bulkActionDone` Event
 
@@ -24,22 +39,32 @@ The `EventContext` carries the following properties (basically, the `BulkStatus`
 | `action` | `String` | The bulk action name (e.g. `"setProperties"`, `"csvExport"`) |
 | `username` | `String` | The user who submitted the command |
 | `state` | `String` | The final state: `"COMPLETED"` or `"ABORTED"` |
-| `processed` | `long` | Number of documents processed |
-| `total` | `long` | Total number of documents in the command |
+| `processed` | `long` | Number of documents the action was applied to. Does **not** include skipped documents, so `processed + errorCount` does not necessarily equal `total` |
+| `skipCount` | `long` | Number of documents the action deliberately skipped |
+| `total` | `long` | Total number of documents in the document set. **Can be `0`** if the scroll never completed — e.g. a command aborted while still scrolling. Always guard before dividing by it |
+| `queryLimitReached` | `boolean` | `true` when the scroller query was truncated, meaning the command ran against a **partial** document set. A listener that reports "done" without checking this is reporting a falsehood |
 | `errorCount` | `long` | Number of errors encountered during processing |
 | `errorCode` | `int` | Error code, or `0` if none |
 | `errorMessage` | `String` | Error message, or `null` if none |
-| `processingDurationMillis` | `long` | Total processing duration in milliseconds |
+| `processingDurationMillis` | `long` | Accumulated **action** processing time in milliseconds (not wall-clock latency) |
 | `repository` | `String` | The repository the command ran against (may be `null` if the command record was already evicted) |
 | `query` | `String` | The NXQL query used to scroll documents (may be `null` for non-query scrollers or if evicted) |
 | `actionParams` | `Map<String, Serializable>` | The raw params map passed to `BulkCommand.Builder.param(...)`. Empty map if the command record was already evicted. |
+| `result` | `Map<String, Serializable>` | The action result map (`BulkStatus.getResult()`). Empty unless the action populated it — see [Per-Document Failures](#per-document-failures). **Unmodifiable**, and never `null` |
+
+> [!NOTE]
+> `skipCount`, `queryLimitReached` and `result` were added in **2025.3**.
 
 `repository`, `query` and `actionParams` are looked up via `BulkService.getCommand(commandId)` at event-firing time. The event is still fired even if the command record has been evicted from the bulk KV store — those three properties will simply be `null` / empty.
 
+Not carried by the event: `submitTime`, `completedTime`, `scrollStartTime`, `scrollEndTime`. If you need them, read them from `BulkService.getStatus(commandId)` — subject to the status TTL described below.
+
 > [!WARNING]
-> **Do not log `actionParams` or `query` wholesale.**
+> **Do not log `actionParams`, `query` or `result` wholesale.**
 >
-> Depending on the action, `actionParams` may contain sensitive values: for the `automation` action it holds the full operation parameter map, for a custom action it holds whatever the action author put there. `query` may embed document identifiers or values used in NXQL predicates. Log `commandId` and `action`, and extract only the specific parameters you actually need.
+> Depending on the action, `actionParams` may contain sensitive values: for the `automation` action it holds the full operation parameter map, for a custom action it holds whatever the action author put there. `query` may embed document identifiers or values used in NXQL predicates. `result` holds whatever a custom action chose to publish. Log `commandId` and `action`, and extract only the specific parameters you actually need.
+>
+> This is not only about logging. For **asynchronous post-commit** listeners, Nuxeo serialises the whole event — `actionParams` and `result` included — into the WorkManager stream, where it persists for the stream retention period. Treat these properties as data at rest, not just as something you might accidentally log.
 
 ### Reading `actionParams` in a listener
 
@@ -57,14 +82,36 @@ if(AutomationBulkAction.ACTION_NAME.equals(action)) {
 }
 ```
 
+### Per-Document Failures
+
 > [!IMPORTANT]
-> **Per-Document Failures**
-> 
-> `errorCount` is just a counter — a `long` incremented by the action's computation each time it catches an error while processing a document or a batch. `errorCode` and `errorMessage` carry only one representative error (typically the last one seen), not a list. The event does not include the IDs of the documents that failed.
-> 
+> `errorCount` is just a counter — a `long` incremented by the action's computation each time it catches an error while processing a document or a batch. `errorCode` and `errorMessage` carry only one representative error (typically the last one seen), not a list. **The event does not include the IDs of the documents that failed.**
+>
 > `BulkStatus` is a stream record and must stay small and bounded, so the Bulk Action Framework intentionally does not keep per-document failure detail anywhere addressable by `commandId`. For stock actions (`setProperties`, `trash`, `reindex`, `deletion`, `removeProxy`, …) the only place failed document IDs land is `server.log`, with the `commandId` in MDC. There is no programmatic API to enumerate them after the fact.
-> 
-> If you need the list, the only API-grade path is to author a custom BAF action whose computation collects failed document IDs and calls `status.setResult(Map.of("failedDocIds", List.of(...)))` before publishing the status. That map is round-tripped through the bulk codec, so a custom action can surface failure detail to listeners via `BulkStatus.getResult()` — but it requires owning the action.
+
+If you need the list, the only API-grade path is to **author a custom BAF action** whose computation collects the failed document IDs and publishes them on the status:
+
+```java
+// in your custom action's computation, before the status is published
+status.setResult(Map.of("failedDocIds", (Serializable) new ArrayList<>(failedIds)));
+```
+
+That map is round-tripped through the bulk codec and delivered to your listener as the **`result`** event property:
+
+```java
+@SuppressWarnings("unchecked")
+var result = (Map<String, Serializable>) event.getContext().getProperty("result");
+@SuppressWarnings("unchecked")
+var failedDocIds = (List<String>) result.get("failedDocIds");
+```
+
+Three things to know about `result`:
+
+- It is **always present and never `null`** — an empty map when the action published nothing.
+- It is **unmodifiable**. Copy it if you need to mutate it.
+- The bulk codec serialises it **through JSON**, so you get Jackson's default bindings on the way out (`Integer` / `Long` / `Double` / `String` / `Boolean` / `ArrayList` / `LinkedHashMap`), *not* the exact types your action stored. A `Set` comes back as a `List`; a `Long` that fits in an `int` may come back as an `Integer`. Code defensively.
+
+`result` is also available — along with `submitTime`, `completedTime` and the other `BulkStatus` fields the event does not carry — from `BulkService.getStatus(commandId)`. Read it promptly: the status record is evicted **1 hour** after a clean completion, **2 days** if it completed with errors, and **4 days** if it was aborted.
 
 ## How it Works
 
@@ -192,16 +239,31 @@ Effective filter: `{setProperties, csvExport}`. The event is fired for both.
 
 In this chain, you can access the misc. properties of the even using `ctx.Event.getContext().getProperty()`.
 
+> [!WARNING]
+> **Leave every filter on the Event Handler empty — document filters _and_ user filters.**
+>
+> `bulkActionDone` carries no source document and no principal (see the note below), and Nuxeo's automation event dispatcher evaluates handler filters against both. The two families fail differently, and one of them fails silently:
+>
+> | Filter | What happens |
+> |---|---|
+> | Document filters: *doctype*, *facet*, *lifecycle state*, *path starts with*, *attribute* | Evaluated against a `null` document → the handler is **silently skipped**. No error, no log line. |
+> | User filters: *user is member of group*, *user is administrator* | Evaluated against a `null` principal → **`NullPointerException`**. Nuxeo swallows it, so your chain **never runs** and the only trace is a stack trace in `server.log`. |
+>
+> If your handler never fires, check this first. Do the filtering **inside the chain** instead, on the `action` and `username` properties — and read the security note below before you trust `username`.
+
 > [!TIP]
 > Reminder: As the event is trigger without an explicit user context, do not forget to start your script with a call to `Auth.LoginAs()`.
+
+> [!NOTE]
+> On a **multi-repository** instance, be aware that `Auth.LoginAs(null, {})` opens a session on the **default** repository — the event context carries no session for it to inherit from. Read the `repository` property and target it explicitly rather than relying on the default.
 
 > [!CAUTION]
 > **`Auth.LoginAs(null, {})` performs a system login, with no permission checks.**
 >
-> The `action`, `query`, `actionParams` and `username` properties are supplied by **whoever submitted the bulk command**. The BAF is exposed over REST, so any authenticated user who can submit a bulk command controls those values. A chain that runs as system and then feeds them into a query, a script, a document update or an outbound request is performing a privileged operation on untrusted input.
+> The `action`, `query`, `actionParams`, `result` and `username` properties are supplied by **whoever submitted the bulk command** (`result` by whoever authored the action). The BAF is exposed over REST, so any authenticated user who can submit a bulk command controls those values. A chain that runs as system and then feeds them into a query, a script, a document update or an outbound request is performing a privileged operation on untrusted input.
 >
 > - Validate `action` against an allow-list before doing anything.
-> - Never interpolate `query` or `actionParams` values into NXQL, into a script, or into an outbound request without validating them first.
+> - Never interpolate `query`, `actionParams` or `result` values into NXQL, into a script, or into an outbound request without validating them first.
 > - Restrict the plugin to the actions you own via [Filtering Which Actions Trigger the Event](#filtering-which-actions-trigger-the-event), so your handlers cannot be reached by arbitrary user-submitted commands.
 > - Do not treat `username` as an authorization decision: it tells you who submitted the command, not what they are allowed to cause.
 
@@ -218,13 +280,16 @@ function run(input, params) {
   var action = eventContext.getProperty("action");
   var state = eventContext.getProperty("state");
   var processed = eventContext.getProperty("processed");
+  var skipCount = eventContext.getProperty("skipCount");
   var total = eventContext.getProperty("total");
+  var queryLimitReached = eventContext.getProperty("queryLimitReached");
   var errorCount = eventContext.getProperty("errorCount");
   var errorCode = eventContext.getProperty("errorCode");
   var errorMessage = eventContext.getProperty("errorMessage");
   var query = eventContext.getProperty("query");
   var repository = eventContext.getProperty("repository");
   var actionParams = eventContext.getProperty("actionParams");
+  var result = eventContext.getProperty("result");
 
   /* Delivery is at-least-once: this chain may run more than once for the same
      commandId. Guard any non-idempotent side effect (mail, webhook, counter). */
@@ -277,7 +342,9 @@ public class MyBulkActionDoneListener implements EventListener {
         var action = (String) ctx.getProperty("action");
         var state = (String) ctx.getProperty("state");
         var processed = (long) ctx.getProperty("processed");
+        var skipCount = (long) ctx.getProperty("skipCount");
         var total = (long) ctx.getProperty("total");
+        var queryLimitReached = (boolean) ctx.getProperty("queryLimitReached");
         var errorCount = (long) ctx.getProperty("errorCount");
         var errorCode = (int) ctx.getProperty("errorCode");
         var errorMessage = (String) ctx.getProperty("errorMessage");
@@ -285,9 +352,16 @@ public class MyBulkActionDoneListener implements EventListener {
         var repository = (String) ctx.getProperty("repository");
         @SuppressWarnings("unchecked")
         var actionParams = (Map<String, Serializable>) ctx.getProperty("actionParams");
+        @SuppressWarnings("unchecked")
+        var result = (Map<String, Serializable>) ctx.getProperty("result");
 
         if (!"COMPLETED".equals(state) || !"setProperties".equals(action)) {
             return;
+        }
+
+        // The command may have run against a truncated document set: "COMPLETED" does not mean "exhaustive".
+        if (queryLimitReached) {
+            log.warn("Command {} hit the scroller query limit; the document set was partial", commandId);
         }
 
         // Delivery is at-least-once: make sure this is a no-op if we already handled commandId.
@@ -295,8 +369,14 @@ public class MyBulkActionDoneListener implements EventListener {
             return;
         }
 
-        // There is an active transaction, so a CoreSession can be opened normally.
-        // Note the event context carries no principal and no session: open your own.
+        /*
+         * There is an active transaction, so a CoreSession can be opened normally, and the event context carries
+         * no principal and no session - open your own.
+         *
+         * WARNING: writing documents here schedules new bulk commands, which fire new bulkActionDone events, which
+         * run this listener again. Only do it if the plugin is restricted to action names you own. See
+         * "Never write documents from an unfiltered listener" at the top of this README.
+         */
         if (repository != null) {
             CoreInstance.doPrivileged(repository, session -> {
                 // do something
@@ -340,6 +420,8 @@ A post-commit listener implements `PostCommitEventListener` (it receives an `Eve
 - `bulk/done` has a single partition, so notifications are processed **sequentially on one thread**. Keep inline listeners fast, or use an async post-commit listener
 - On a **first install on an existing cluster**, the plugin replays the retained `bulk/done` history unless you move the consumer group to the end of the stream first
 - The event is fired for **every** bulk action by default. To restrict to specific action names, contribute to the `nuxeo.labs.baf.notification.service` extension point — see [Filtering Which Actions Trigger the Event](#filtering-which-actions-trigger-the-event). You can still filter further in your listener by reading the `action` property if needed
+- **Never write documents from an unfiltered listener** — it creates an unbounded feedback loop. See the warning at the top of this README
+- A Studio Event Handler on `bulkActionDone` must have **no filters at all**: document filters are silently skipped, user filters throw. See [Event Handler in Nuxeo Studio](#event-handler-in-nuxeo-studio)
 
 
 ## How to Build and Deploy

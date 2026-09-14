@@ -46,8 +46,11 @@ import org.nuxeo.runtime.transaction.TransactionHelper;
  * <li>{@code action} - the bulk action name (e.g. "setProperties", "csvExport")</li>
  * <li>{@code username} - the user who submitted the command</li>
  * <li>{@code state} - the final state: "COMPLETED" or "ABORTED"</li>
- * <li>{@code processed} - number of documents processed</li>
- * <li>{@code total} - total number of documents in the command</li>
+ * <li>{@code processed} - number of documents the action was applied to; does NOT include skipped documents</li>
+ * <li>{@code skipCount} - number of documents deliberately skipped by the action (since 2025.3)</li>
+ * <li>{@code total} - total number of documents in the document set, 0 if the scroll never completed</li>
+ * <li>{@code queryLimitReached} - true when the scroller query was truncated, so the command ran against a
+ *     PARTIAL document set (since 2025.3)</li>
  * <li>{@code errorCount} - number of errors encountered</li>
  * <li>{@code errorCode} - the error code, or 0 if none</li>
  * <li>{@code errorMessage} - the error message, or null if none</li>
@@ -57,6 +60,12 @@ import org.nuxeo.runtime.transaction.TransactionHelper;
  * <li>{@code actionParams} - the raw {@code Map<String, Serializable>} from
  *     {@link org.nuxeo.ecm.core.bulk.message.BulkCommand#getParams()} (empty map if the command record was
  *     already evicted)</li>
+ * <li>{@code result} - the unmodifiable action result map from
+ *     {@link org.nuxeo.ecm.core.bulk.message.BulkStatus#getResult()}, empty unless the action populated it. This
+ *     is the only supported channel for a custom action to surface per-document detail (e.g. failed document
+ *     ids). Values are round-tripped through JSON by the bulk codec, so expect Jackson's default bindings
+ *     ({@code Integer}/{@code Long}/{@code Double}/{@code String}/{@code Boolean}/{@code ArrayList}/
+ *     {@code LinkedHashMap}) rather than the exact types the action stored (since 2025.3)</li>
  * </ul>
  * <p>
  * <b>Transaction.</b> A stream computation thread carries no ambient transaction. The event is therefore fired inside
@@ -135,7 +144,9 @@ public class BulkActionDoneComputation extends AbstractComputation {
         eventCtx.setProperty("username", status.getUsername());
         eventCtx.setProperty("state", state != null ? state.name() : null);
         eventCtx.setProperty("processed", status.getProcessed());
+        eventCtx.setProperty("skipCount", status.getSkipCount());
         eventCtx.setProperty("total", status.getTotal());
+        eventCtx.setProperty("queryLimitReached", status.isQueryLimitReached());
         eventCtx.setProperty("errorCount", status.getErrorCount());
         eventCtx.setProperty("errorCode", status.getErrorCode());
         eventCtx.setProperty("errorMessage", status.getErrorMessage());
@@ -143,6 +154,12 @@ public class BulkActionDoneComputation extends AbstractComputation {
         eventCtx.setProperty("repository", repository);
         eventCtx.setProperty("query", query);
         eventCtx.setProperty("actionParams", (Serializable) actionParams);
+        /*
+         * BulkStatus#getResult wraps the map in Collections.unmodifiableMap, which is Serializable, and the bulk
+         * codec's MapAsJsonAsStringEncoding decodes a missing result to an empty map rather than null - so this is
+         * always safe and never null.
+         */
+        eventCtx.setProperty("result", (Serializable) status.getResult());
 
         var event = new EventImpl(EVENT_NAME, eventCtx);
         try {

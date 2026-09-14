@@ -90,19 +90,31 @@ Constants live on `BulkActionDoneComputation`:
 - `COMPUTATION_NAME = "bulkActionDoneNotifier"`
 
 Event context properties (keep this list in sync with `BulkActionDoneComputation.processRecord`):
-`commandId`, `action`, `username`, `state` (enum name: `COMPLETED` / `ABORTED`), `processed`, `total`, `errorCount`, `errorCode`, `errorMessage`, `processingDurationMillis`, `repository`, `query`, `actionParams`.
+`commandId`, `action`, `username`, `state` (enum name: `COMPLETED` / `ABORTED`), `processed`, `skipCount`, `total`,
+`queryLimitReached`, `errorCount`, `errorCode`, `errorMessage`, `processingDurationMillis`, `repository`, `query`,
+`actionParams`, `result`.
+
+`skipCount`, `queryLimitReached` and `result` are `@since 2025.3`.
 
 `repository`, `query` and `actionParams` are pulled from the originating `BulkCommand` via `BulkService.getCommand(status.getId())`. If the command record was already evicted from the bulk KV store, `repository` and `query` are `null` and `actionParams` is `Map.of()` — the event is still fired. `actionParams` is the raw `Map<String, Serializable>` from `BulkCommand.getParams()`; cast it back in listeners.
 
-`errorCount` is a count only. `BulkStatus` carries no list of failed document IDs and stock BAF actions do not expose one; per-doc failures land in `server.log` only. Do not add code that tries to enumerate failed docs for stock actions — there is no API. A custom action can surface them by calling `status.setResult(...)` (not currently forwarded to the event context; add it if/when needed).
+`errorCount` is a count only. `BulkStatus` carries no list of failed document IDs and stock BAF actions do not expose one; per-doc failures land in `server.log` only. Do not add code that tries to enumerate failed docs for stock actions — there is no API. A custom action surfaces them by calling `status.setResult(...)`, which **is** forwarded to the event as the `result` property.
+
+`result` is safe to forward unguarded: `BulkStatus.getResult()` wraps in `Collections.unmodifiableMap` (Serializable), and the codec's `MapAsJsonAsStringEncoding.read` returns `emptyMap()` — never `null` — for a missing value. But it is a **JSON** round-trip, so listeners get Jackson's default bindings, not the types the action stored. `TestBulkActionDoneEvent#testActionResultIsForwardedToTheEvent` injects a synthetic record to prove the round-trip (no stock action populates `result`).
+
+Not forwarded, deliberately, to keep the payload small — it is serialised into the WorkManager stream for every async post-commit listener: `submitTime`, `completedTime`, `scrollStartTime`, `scrollEndTime`. Listeners read them from `BulkService.getStatus(commandId)`.
+
+Two payload caveats that must stay in the README: `total` is `0` when the scroll never completed, and `processed` excludes `skipCount`, so `processed + errorCount != total` is not an invariant.
 
 The event context carries **no principal and no `CoreSession`** (`new EventContextImpl()` binds to the public varargs constructor, so both are `null`, and `repositoryName` is `null` too). Listeners must open their own session. Do not "fix" this by passing a session into the context — the computation has none to give, and the context is copied into a `ShallowEvent` anyway.
 
+The `null` principal has a documented consequence, do not lose it: a Studio Event Handler with a **user** filter (`filters/group`, `filters/isAdministrator`) NPEs in `EventHandler.isEnabled`, and `EventServiceImpl.fireEvent` swallows it — the chain silently never runs. Document filters merely skip silently. Both are documented in `README.md` and `README-MANUAL-TESTING.md` §4.5. Do **not** "fix" this by setting a `SystemPrincipal`: that would make an `isAdministrator` filter pass, turning a crash into a privilege check that always succeeds. Also do not set `repositoryName` without a principal — `ReconnectedEventBundleImpl` calls `ctx.getPrincipal().getActingUser()` whenever the repository name is non-null.
+
 ## Testing
 
-Five test classes (23 tests). Every regression guard below was verified to **fail** against the pre-fix code — if you change one, re-verify the same way rather than trusting a green run.
+Five test classes (24 tests). Every regression guard below was verified to **fail** against the pre-fix code — if you change one, re-verify the same way rather than trusting a green run.
 
-- `TestBulkActionDoneEvent` — submits a real BAF command and asserts on the event. Holds **three regression guards for the transaction invariant** (see Architecture): `testListenerRunsInTransactionAndCanUseCoreSession`, `testPostCommitListenerIsNotified`, and `testNoEventBundleLeakOnComputationThread`. Do not weaken them.
+- `TestBulkActionDoneEvent` — submits a real BAF command and asserts on the event. Holds **three regression guards for the transaction invariant** (see Architecture): `testListenerRunsInTransactionAndCanUseCoreSession`, `testPostCommitListenerIsNotified`, and `testNoEventBundleLeakOnComputationThread`. Do not weaken them. `testEventFiredOnCompletion` asserts the **whole** payload; it deliberately compares counter *relationships* (`processed == total`) rather than absolute numbers so it does not depend on how many documents the repository holds. `testActionResultIsForwardedToTheEvent` injects a synthetic record because no stock action populates `result`.
 - `TestBAFNotificationFiltering` — action-name filter end to end. `test-filter-nomatch-contrib.xml` (action `noSuchActionEverFired`) is deployed at the **class level** so every test sees `hasContributions() == true` and `shouldNotify("setProperties") == false`. `test-filter-match-contrib.xml` (action `setProperties`) is deployed per-test on the methods that need the union to match. Never deploy either on `TestBulkActionDoneEvent` — it relies on the fire-all default.
 - `TestBAFNotificationServiceFilterState` — drives `registerContribution`/`unregisterContribution` programmatically (no XML): unregister, partial unregister, the empty-contribution footgun, blank-name stripping, and the M4 WARNING + runtime message. Builds descriptors by assigning the package-visible `BAFNotificationConfigDescriptor.actions` field directly — that is why no public setter exists. The service is a singleton shared with the other classes, so every test must restore the fire-all default in a `finally`.
 - `TestBulkActionDoneStreamSemantics` — at-least-once delivery, the seek-to-end mitigation, and consumer lag. **Stops, rewinds and restarts the shared computation**, hence its own class and an unconditional `@After` that restores position-to-end + restarted. `FeaturesRunner` reuses the runtime across classes with an identical feature/deploy set, so a half-finished test would otherwise leave a stopped consumer for the next class.

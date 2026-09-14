@@ -31,6 +31,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -41,6 +42,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.nuxeo.ecm.core.api.CoreInstance;
 import org.nuxeo.ecm.core.api.CoreSession;
+import org.nuxeo.ecm.core.bulk.BulkCodecs;
 import org.nuxeo.ecm.core.bulk.BulkService;
 import org.nuxeo.ecm.core.bulk.CoreBulkFeature;
 import org.nuxeo.ecm.core.bulk.message.BulkCommand;
@@ -51,6 +53,7 @@ import org.nuxeo.ecm.core.event.EventListener;
 import org.nuxeo.ecm.core.event.PostCommitEventListener;
 import org.nuxeo.ecm.core.event.impl.EventServiceImpl;
 import org.nuxeo.ecm.core.test.CoreFeature;
+import org.nuxeo.lib.stream.computation.Record;
 import org.nuxeo.lib.stream.log.Name;
 import org.nuxeo.runtime.api.Framework;
 import org.nuxeo.runtime.stream.StreamService;
@@ -75,6 +78,10 @@ public class TestBulkActionDoneEvent {
     protected static final String ALL_DOCS_QUERY =
             "SELECT * FROM Document WHERE ecm:isVersion = 0 AND ecm:isTrashed = 0";
 
+    protected static final Name DONE_STREAM = Name.ofUrn("bulk/done");
+
+    protected static final Name COMPUTATION = Name.ofUrn(BulkActionDoneComputation.COMPUTATION_NAME);
+
     @Inject
     protected CoreSession session;
 
@@ -97,10 +104,12 @@ public class TestBulkActionDoneEvent {
         assertTrue("Bulk command %s did not reach a final state within 30s".formatted(commandId),
                 bulkService.await(commandId, Duration.ofSeconds(30)));
         assertTrue("Computation %s did not drain bulk/done within 30s".formatted(
-                BulkActionDoneComputation.COMPUTATION_NAME),
-                Framework.getService(StreamService.class)
-                         .await(Name.ofUrn("bulk/done"),
-                                 Name.ofUrn(BulkActionDoneComputation.COMPUTATION_NAME), Duration.ofSeconds(30)));
+                BulkActionDoneComputation.COMPUTATION_NAME), awaitDrained());
+    }
+
+    /** Stream first, computation second - see the note in TestBulkActionDoneStreamSemantics. */
+    protected boolean awaitDrained() throws InterruptedException {
+        return Framework.getService(StreamService.class).await(DONE_STREAM, COMPUTATION, Duration.ofSeconds(30));
     }
 
     protected String submitSetProperties(String description) {
@@ -132,16 +141,74 @@ public class TestBulkActionDoneEvent {
                                                         "Expected a bulkActionDone event for command " + commandId));
 
         var ctx = capture.event().getContext();
+        assertEquals(commandId, ctx.getProperty("commandId"));
         assertEquals("setProperties", ctx.getProperty("action"));
         assertEquals("COMPLETED", ctx.getProperty("state"));
+        assertEquals(session.getPrincipal().getName(), ctx.getProperty("username"));
         assertEquals(session.getRepositoryName(), ctx.getProperty("repository"));
         assertEquals(ALL_DOCS_QUERY, ctx.getProperty("query"));
+
+        /*
+         * Counters: assert the relationships rather than absolute numbers, so the test does not depend on how many
+         * documents the repository happens to hold. A dropped property still fails, because getProperty returns null
+         * and the comparison with a boxed primitive fails.
+         */
+        var total = (long) ctx.getProperty("total");
+        assertTrue("The command must have scrolled at least the document created above", total >= 1);
+        assertEquals("Every scrolled document must be processed", total, (long) ctx.getProperty("processed"));
+        assertEquals(0L, ctx.getProperty("skipCount"));
+        assertEquals(0L, ctx.getProperty("errorCount"));
+        assertEquals(0, ctx.getProperty("errorCode"));
+        assertNull(ctx.getProperty("errorMessage"));
+        assertEquals(Boolean.FALSE, ctx.getProperty("queryLimitReached"));
+        assertNotNull(ctx.getProperty("processingDurationMillis"));
+
+        // setProperties populates no action result, but the property must always be present and never null.
+        assertEquals(Map.of(), ctx.getProperty("result"));
 
         @SuppressWarnings("unchecked")
         var actionParams = (Map<String, Serializable>) ctx.getProperty("actionParams");
         assertNotNull("actionParams must be set", actionParams);
         assertEquals("Updated by bulk", actionParams.get("dc:description"));
         assertEquals("demo", actionParams.get("dc:source"));
+    }
+
+    /**
+     * {@code BulkStatus#getResult} is the only supported channel for a custom action to surface per-document detail
+     * (typically the ids of the documents it failed on), and the README documents it as such. This test proves the
+     * map actually reaches the listener.
+     * <p>
+     * No stock action populates {@code result}, so the status is injected directly into {@code bulk/done}. As for
+     * {@link TestBulkActionDoneErrorHandling}, that is not mocking the bulk service: it is the only way to reach a
+     * branch the real pipeline never produces on its own.
+     *
+     * @since 2025.3
+     */
+    @Test
+    public void testActionResultIsForwardedToTheEvent() throws InterruptedException {
+        TestBulkActionDoneListener.reset();
+
+        var commandId = UUID.randomUUID().toString();
+        var status = new BulkStatus(commandId);
+        status.setAction("setProperties");
+        status.setState(BulkStatus.State.COMPLETED);
+        status.setResult(Map.of("failedDocIds", (Serializable) new ArrayList<>(List.of("doc-1", "doc-2"))));
+
+        var streamService = Framework.getService(StreamService.class);
+        streamService.getStreamManager()
+                     .append(DONE_STREAM.getUrn(),
+                             Record.of(commandId, BulkCodecs.getStatusCodec().encode(status)));
+        assertTrue("Computation did not drain bulk/done within 30s", awaitDrained());
+
+        var capture = TestBulkActionDoneListener.forCommand(commandId)
+                                                .orElseThrow(() -> new AssertionError(
+                                                        "Expected a bulkActionDone event for command " + commandId));
+
+        @SuppressWarnings("unchecked")
+        var result = (Map<String, Serializable>) capture.event().getContext().getProperty("result");
+        assertNotNull("The action result must be forwarded to the event", result);
+        // The bulk codec round-trips the map through JSON, so expect Jackson's default bindings, not the exact types.
+        assertEquals(List.of("doc-1", "doc-2"), result.get("failedDocIds"));
     }
 
     /**
