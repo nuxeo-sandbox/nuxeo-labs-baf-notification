@@ -29,5 +29,4 @@ bin/
 *-bak
 *.bak
 .opencode
-AGENTS.md
 .vscode
